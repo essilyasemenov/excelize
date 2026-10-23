@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/xml"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -21,7 +22,7 @@ func TestGetRows(t *testing.T) {
 	f.SharedStrings = nil
 	f.Pkg.Store(defaultXMLPathSharedStrings, MacintoshCyrillicCharset)
 	_, err := f.GetRows("Sheet1")
-	assert.NoError(t, err)
+	assert.EqualError(t, err, "XML syntax error on line 1: invalid UTF-8")
 	// Test get rows with row number over max row number limit
 	f.Sheet.Delete("xl/worksheets/sheet1.xml")
 	f.Pkg.Store("xl/worksheets/sheet1.xml", fmt.Appendf(nil, `<worksheet xmlns="%s"><sheetData><row r="%d"><c t="s"><v>0</v></c></row></sheetData></worksheet>`, NameSpaceSpreadSheet.Value, TotalRows+1))
@@ -245,32 +246,30 @@ func TestColumns(t *testing.T) {
 	rows, err := f.Rows("Sheet1")
 	assert.NoError(t, err)
 
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="2"><c r="A1" t="s"><v>1</v></c></row></sheetData></worksheet>`)))
+	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="2"><c r="A2" t="str"><v>1</v></c></row></sheetData></worksheet>`)))
 	_, err = rows.Columns()
 	assert.NoError(t, err)
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="2"><c r="A1" t="s"><v>1</v></c></row></sheetData></worksheet>`)))
-	rows.curRow = 1
-	_, err = rows.Columns()
-	assert.NoError(t, err)
-
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="A"><c r="A1" t="s"><v>1</v></c></row><row r="A"><c r="2" t="inlineStr"><is><t>B</t></is></c></row></sheetData></worksheet>`)))
-	assert.True(t, rows.Next())
-	_, err = rows.Columns()
-	assert.EqualError(t, err, `strconv.Atoi: parsing "A": invalid syntax`)
-
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="1"><c r="A1" t="s"><v>1</v></c></row><row r="A"><c r="2" t="inlineStr"><is><t>B</t></is></c></row></sheetData></worksheet>`)))
+	rows = &Rows{f: f, curRow: 1, decoder: f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="2"><c r="A2" t="str"><v>1</v></c></row></sheetData></worksheet>`)))}
 	_, err = rows.Columns()
 	assert.NoError(t, err)
 
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="1"><c r="A" t="s"><v>1</v></c></row></sheetData></worksheet>`)))
+	rows = &Rows{f: f, decoder: f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="A"><c r="A1" t="s"><v>1</v></c></row></sheetData></worksheet>`)))}
+	assert.False(t, rows.Next())
+	assert.EqualError(t, rows.Error(), `strconv.Atoi: parsing "A": invalid syntax`)
+
+	rows = &Rows{f: f, decoder: f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="1"><c r="A1" t="str"><v>1</v></c></row></sheetData></worksheet>`)))}
+	_, err = rows.Columns()
+	assert.NoError(t, err)
+
+	rows = &Rows{f: f, decoder: f.xmlNewDecoder(bytes.NewReader([]byte(`<worksheet><sheetData><row r="1"><c r="A" t="s"><v>1</v></c></row></sheetData></worksheet>`)))}
 	assert.True(t, rows.Next())
 	_, err = rows.Columns()
 	assert.Equal(t, newCellNameToCoordinatesError("A", newInvalidCellNameError("A")), err)
 
 	// Test token is nil
-	rows.decoder = f.xmlNewDecoder(bytes.NewReader(nil))
+	rows = &Rows{f: f, decoder: f.xmlNewDecoder(bytes.NewReader(nil))}
 	_, err = rows.Columns()
-	assert.NoError(t, err)
+	assert.ErrorIs(t, err, io.ErrUnexpectedEOF)
 }
 
 func TestGetFromStringItem(t *testing.T) {

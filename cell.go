@@ -650,7 +650,10 @@ func (c *xlsxC) getValueFrom(f *File, d *xlsxSST, raw bool) (string, error) {
 		return c.getCellDate(f, raw)
 	case "s":
 		if c.V != "" {
-			xlsxSI, _ := strconv.Atoi(strings.TrimSpace(c.V))
+			xlsxSI, err := strconv.Atoi(strings.TrimSpace(c.V))
+			if err != nil {
+				return "", err
+			}
 			if _, ok := f.tempFiles.Load(defaultXMLPathSharedStrings); ok {
 				val, err := f.getFromStringItem(xlsxSI)
 				if err != nil {

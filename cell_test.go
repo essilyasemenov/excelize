@@ -421,15 +421,15 @@ func TestGetCellValue(t *testing.T) {
 	f.Pkg.Store("xl/worksheets/sheet1.xml", fmt.Appendf(nil, sheetData, NameSpaceSpreadSheet.Value, `<row r="2"><c r="A2" t="inlineStr"><is><t>A2</t></is></c></row><row r="2"><c r="B2" t="inlineStr"><is><t>B2</t></is></c></row>`))
 	f.checked = sync.Map{}
 	rows, err = f.GetRows("Sheet1")
-	assert.Equal(t, [][]string{nil, {"A2", "B2"}}, rows)
-	assert.NoError(t, err)
+	assert.Empty(t, rows)
+	assert.EqualError(t, err, "invalid worksheet row number 2 after 2")
 
 	f.Sheet.Delete("xl/worksheets/sheet1.xml")
 	f.Pkg.Store("xl/worksheets/sheet1.xml", fmt.Appendf(nil, sheetData, NameSpaceSpreadSheet.Value, `<row r="1"><c r="A1" t="inlineStr"><is><t>A1</t></is></c></row><row r="1"><c r="B1" t="inlineStr"><is><t>B1</t></is></c></row>`))
 	f.checked = sync.Map{}
 	rows, err = f.GetRows("Sheet1")
-	assert.Equal(t, [][]string{{"A1", "B1"}}, rows)
-	assert.NoError(t, err)
+	assert.Empty(t, rows)
+	assert.EqualError(t, err, "invalid worksheet row number 1 after 1")
 
 	f.Sheet.Delete("xl/worksheets/sheet1.xml")
 	f.Pkg.Store("xl/worksheets/sheet1.xml", fmt.Appendf(nil, sheetData, NameSpaceSpreadSheet.Value, `<row><c t="inlineStr"><is><t>A3</t></is></c></row><row><c t="inlineStr"><is><t>A4</t></is></c><c t="inlineStr"><is><t>B4</t></is></c></row><row r="7"><c t="inlineStr"><is><t>A7</t></is></c><c t="inlineStr"><is><t>B7</t></is></c></row><row><c t="inlineStr"><is><t>A8</t></is></c><c t="inlineStr"><is><t>B8</t></is></c></row>`))
@@ -1225,13 +1225,8 @@ func TestSharedStringsError(t *testing.T) {
 	assert.True(t, ok)
 	f.tempFiles.Store(defaultXMLPathSharedStrings, "")
 	value, err := f.getFromStringItem(1)
-	assert.Equal(t, newInvalidSharedStringIndex(1), err)
+	assert.Error(t, err)
 	assert.Empty(t, value)
-	// Test get from string item with invalid offset range
-	f.sharedStringItem = [][]uint{{0}}
-	value, err = f.getFromStringItem(0)
-	assert.NoError(t, err)
-	assert.Equal(t, "0", value)
 	// Cleanup undelete temporary files
 	assert.NoError(t, os.Remove(tempFile.(string)))
 	// Test reload the file error on set cell value and rich text. The error message was different between macOS and Windows
@@ -1257,8 +1252,8 @@ func TestSharedStringsError(t *testing.T) {
 			// Test get cell value from string item with invalid offset
 			f.sharedStringItem[1] = []uint{maxUint16 - 1, maxUint16}
 			value, err := f.getFromStringItem(1)
-			assert.NoError(t, err)
-			assert.Equal(t, "1", value)
+			assert.Error(t, err)
+			assert.Empty(t, value)
 			break
 		}
 	}

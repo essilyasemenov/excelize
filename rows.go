@@ -14,6 +14,8 @@ package excelize
 import (
 	"bytes"
 	"encoding/xml"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
@@ -93,6 +95,75 @@ type Rows struct {
 	decoder                 *xml.Decoder
 	token                   xml.Token
 	curRowOpts, seekRowOpts RowOpts
+	path                    []xml.Name
+	rootSeen, sheetDataSeen bool
+}
+
+func (rows *Rows) nextToken() (xml.Token, error) {
+	token, err := rows.decoder.Token()
+	if err != nil {
+		if err == io.EOF && (!rows.rootSeen || len(rows.path) != 0) {
+			err = io.ErrUnexpectedEOF
+		}
+		return nil, err
+	}
+	switch element := token.(type) {
+	case xml.StartElement:
+		depth := len(rows.path)
+		if depth == 0 {
+			if rows.rootSeen {
+				return nil, fmt.Errorf("unexpected second worksheet root")
+			}
+			switch element.Name.Local {
+			case "worksheet", "chartsheet", "dialogsheet", "macrosheet":
+			default:
+				return nil, fmt.Errorf("unexpected sheet root %q", element.Name.Local)
+			}
+			rows.rootSeen = true
+		}
+		switch element.Name.Local {
+		case "sheetData":
+			if depth != 1 || rows.path[0].Local != "worksheet" || rows.sheetDataSeen {
+				return nil, fmt.Errorf("unexpected sheetData element")
+			}
+			rows.sheetDataSeen = true
+		case "row":
+			if depth != 2 || rows.path[1].Local != "sheetData" {
+				return nil, fmt.Errorf("unexpected row element")
+			}
+			number := rows.curRow + 1
+			for _, attr := range element.Attr {
+				if attr.Name.Local == "r" {
+					number, err = strconv.Atoi(attr.Value)
+					if err != nil {
+						return nil, err
+					}
+				}
+			}
+			if number > TotalRows {
+				return nil, ErrMaxRows
+			}
+			if number <= rows.curRow {
+				return nil, fmt.Errorf("invalid worksheet row number %d after %d", number, rows.curRow)
+			}
+			rows.curRow = number
+		case "c":
+			if depth != 3 || rows.path[2].Local != "row" {
+				return nil, fmt.Errorf("unexpected cell element")
+			}
+		}
+		rows.path = append(rows.path, element.Name)
+	case xml.EndElement:
+		rows.path = rows.path[:len(rows.path)-1]
+	case xml.CharData:
+		if !rows.rootSeen {
+			element = bytes.TrimPrefix(element, []byte("\xef\xbb\xbf"))
+		}
+		if len(rows.path) == 0 && len(bytes.TrimSpace(element)) != 0 {
+			return nil, fmt.Errorf("unexpected text outside worksheet root")
+		}
+	}
+	return token, nil
 }
 
 // Next will return true if it finds the next row element.
@@ -106,29 +177,19 @@ func (rows *Rows) Next() bool {
 		return true
 	}
 	for {
-		token, _ := rows.decoder.Token()
-		if token == nil {
+		token, err := rows.nextToken()
+		if err != nil {
+			if err != io.EOF {
+				rows.err = err
+			}
 			return false
 		}
 		switch xmlElement := token.(type) {
 		case xml.StartElement:
 			if xmlElement.Name.Local == "row" {
-				rows.curRow++
-				rowNum, _ := attrValToInt("r", xmlElement.Attr)
-				if rowNum > TotalRows {
-					rows.err = ErrMaxRows
-					return false
-				}
-				if rowNum != 0 {
-					rows.curRow = rowNum
-				}
 				rows.token = token
 				rows.curRowOpts = extractRowOpts(xmlElement.Attr)
 				return true
-			}
-		case xml.EndElement:
-			if xmlElement.Name.Local == "sheetData" {
-				return false
 			}
 		}
 	}
@@ -144,13 +205,13 @@ func (rows *Rows) Error() error {
 	return rows.err
 }
 
-// Close closes the open worksheet XML file in the system temporary
-// directory.
+// Close closes the temporary worksheet XML file and returns any iteration or
+// close error. Closing early does not validate unread worksheet data.
 func (rows *Rows) Close() error {
 	tempFile := rows.tempFile
 	rows.tempFile = nil
 	if tempFile != nil {
-		return tempFile.Close()
+		rows.err = errors.Join(rows.err, tempFile.Close())
 	}
 	return rows.Error()
 }
@@ -158,7 +219,15 @@ func (rows *Rows) Close() error {
 // Columns return the current row's column values. This fetches the worksheet
 // data as a stream, returns each cell in a row as is, and will not skip empty
 // rows in the tail of the worksheet.
-func (rows *Rows) Columns(opts ...Options) ([]string, error) {
+func (rows *Rows) Columns(opts ...Options) (cells []string, err error) {
+	if rows.err != nil {
+		return nil, rows.err
+	}
+	defer func() {
+		if err != nil {
+			rows.err = err
+		}
+	}()
 	if rows.curRow > rows.seekRow {
 		return nil, nil
 	}
@@ -171,22 +240,16 @@ func (rows *Rows) Columns(opts ...Options) ([]string, error) {
 	for {
 		if rows.token != nil {
 			token = rows.token
-		} else if token, _ = rows.decoder.Token(); token == nil {
-			break
+		} else if token, err = rows.nextToken(); err != nil {
+			if err == io.EOF {
+				return rowIterator.cells, nil
+			}
+			return rowIterator.cells, err
 		}
 		switch xmlElement := token.(type) {
 		case xml.StartElement:
 			rowIterator.inElement = xmlElement.Name.Local
 			if rowIterator.inElement == "row" {
-				rowNum := 0
-				if rowNum, rowIterator.err = attrValToInt("r", xmlElement.Attr); rowNum > TotalRows {
-					rows.err, rows.token = ErrMaxRows, nil
-					return rowIterator.cells, rows.err
-				} else if rowNum != 0 {
-					rows.curRow = rowNum
-				} else if rows.token == nil {
-					rows.curRow++
-				}
 				rows.token = token
 				rows.seekRowOpts = extractRowOpts(xmlElement.Attr)
 				if rows.curRow > rows.seekRow {
@@ -205,7 +268,6 @@ func (rows *Rows) Columns(opts ...Options) ([]string, error) {
 			}
 		}
 	}
-	return rowIterator.cells, rowIterator.err
 }
 
 // extractRowOpts extract row element attributes.
@@ -242,16 +304,28 @@ type rowXMLIterator struct {
 // rowXMLHandler parse the row XML element of the worksheet.
 func (rows *Rows) rowXMLHandler(rowIterator *rowXMLIterator, xmlElement *xml.StartElement, raw bool) {
 	if rowIterator.inElement == "c" {
+		previousCol := rowIterator.cellCol
 		rowIterator.cellCol++
 		colCell := xlsxC{}
-		_ = colCell.cellXMLHandler(rows.decoder, xmlElement)
+		if rowIterator.err = colCell.cellXMLHandler(rows.decoder, xmlElement); rowIterator.err != nil {
+			return
+		}
+		rows.path = rows.path[:len(rows.path)-1]
 		if colCell.R != "" {
-			if rowIterator.cellCol, _, rowIterator.err = CellNameToCoordinates(colCell.R); rowIterator.err != nil {
+			if rowIterator.cellCol, rowIterator.cellRow, rowIterator.err = CellNameToCoordinates(colCell.R); rowIterator.err != nil {
+				return
+			}
+			if rowIterator.cellRow != rows.curRow || rowIterator.cellCol <= previousCol {
+				rowIterator.err = fmt.Errorf("invalid cell position %q in row %d", colCell.R, rows.curRow)
 				return
 			}
 		}
 		blank := rowIterator.cellCol - len(rowIterator.cells)
-		if val, _ := colCell.getValueFrom(rows.f, rows.sst, raw); val != "" || colCell.F != nil {
+		val, err := colCell.getValueFrom(rows.f, rows.sst, raw)
+		if rowIterator.err = err; err != nil {
+			return
+		}
+		if val != "" || colCell.F != nil {
 			rowIterator.cells = append(appendSpace(blank, rowIterator.cells), val)
 		}
 	}
@@ -268,9 +342,10 @@ func (cell *xlsxC) cellXMLAttrHandler(start *xml.StartElement) error {
 			if err != nil {
 				return err
 			}
-			if math.MinInt <= val && val <= math.MaxInt {
-				cell.S = int(val)
+			if val < 0 || val > math.MaxInt {
+				return fmt.Errorf("invalid cell style index %d", val)
 			}
+			cell.S = int(val)
 		case "t":
 			cell.T = attr.Value
 		default:
@@ -286,6 +361,7 @@ func (cell *xlsxC) cellXMLHandler(decoder *xml.Decoder, start *xml.StartElement)
 	if err != nil {
 		return err
 	}
+	var valueSeen, formulaSeen, inlineSeen bool
 	for {
 		tok, err := decoder.Token()
 		if err != nil {
@@ -297,11 +373,27 @@ func (cell *xlsxC) cellXMLHandler(decoder *xml.Decoder, start *xml.StartElement)
 			se = el
 			switch se.Name.Local {
 			case "v":
+				if valueSeen || inlineSeen {
+					return fmt.Errorf("duplicate or conflicting cell value")
+				}
+				valueSeen = true
 				err = decoder.DecodeElement(&cell.V, &se)
 			case "f":
+				if formulaSeen {
+					return fmt.Errorf("duplicate cell formula")
+				}
+				formulaSeen = true
 				err = decoder.DecodeElement(&cell.F, &se)
 			case "is":
+				if inlineSeen || valueSeen {
+					return fmt.Errorf("duplicate or conflicting cell value")
+				}
+				inlineSeen = true
 				err = decoder.DecodeElement(&cell.IS, &se)
+			case "extLst":
+				err = decoder.Skip()
+			default:
+				return fmt.Errorf("unexpected cell element %q", se.Name.Local)
 			}
 			if err != nil {
 				return err
@@ -349,7 +441,10 @@ func (f *File) Rows(sheet string) (*Rows, error) {
 		ws.mu.Lock()
 		defer ws.mu.Unlock()
 		// Flush data
-		output, _ := xml.Marshal(ws)
+		output, err := xml.Marshal(ws)
+		if err != nil {
+			return nil, err
+		}
 		f.saveFileList(name, f.replaceNameSpaceBytes(name, output))
 	}
 	var err error
@@ -363,54 +458,96 @@ func (f *File) Rows(sheet string) (*Rows, error) {
 // the shared string table returns an error, matching the in-memory path in
 // xlsxC.getValueFrom.
 func (f *File) getFromStringItem(index int) (string, error) {
-	if f.sharedStringTemp != nil {
-		if index < 0 || len(f.sharedStringItem) <= index {
-			return "", newInvalidSharedStringIndex(index)
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.sharedStringTemp == nil {
+		table, offsets, err := f.buildSharedStringTable()
+		if err != nil {
+			return "", err
 		}
-		offsetRange := f.sharedStringItem[index]
-		if len(offsetRange) != 2 || offsetRange[0] > offsetRange[1] {
-			return strconv.Itoa(index), nil
-		}
-		buf := make([]byte, offsetRange[1]-offsetRange[0])
-		if _, err := f.sharedStringTemp.ReadAt(buf, int64(offsetRange[0])); err != nil {
-			return strconv.Itoa(index), nil
-		}
-		return string(buf), nil
+		f.sharedStringTemp, f.sharedStringItem = table, offsets
+		f.tempFiles.Store(defaultTempFileSST, table.Name())
 	}
-	needClose, decoder, tempFile, err := f.xmlDecoder(defaultXMLPathSharedStrings)
-	if needClose && err == nil {
-		defer func() {
-			err = tempFile.Close()
-		}()
+	if index < 0 || len(f.sharedStringItem) <= index {
+		return "", newInvalidSharedStringIndex(index)
 	}
-	f.sharedStringItem = [][]uint{}
-	f.sharedStringTemp, _ = os.CreateTemp(f.options.TmpDir, "excelize-")
-	f.tempFiles.Store(defaultTempFileSST, f.sharedStringTemp.Name())
-	var (
-		inElement string
-		i, offset uint
-	)
-	for {
-		token, _ := decoder.Token()
-		if token == nil {
-			break
-		}
-		switch xmlElement := token.(type) {
-		case xml.StartElement:
-			inElement = xmlElement.Name.Local
-			if inElement == "si" {
-				si := xlsxSI{}
-				_ = decoder.DecodeElement(&si, &xmlElement)
+	offsetRange := f.sharedStringItem[index]
+	if len(offsetRange) != 2 || offsetRange[0] > offsetRange[1] {
+		return "", fmt.Errorf("invalid shared string offsets for index %d", index)
+	}
+	buf := make([]byte, offsetRange[1]-offsetRange[0])
+	if _, err := f.sharedStringTemp.ReadAt(buf, int64(offsetRange[0])); err != nil {
+		return "", err
+	}
+	return string(buf), nil
+}
 
-				startIdx := offset
-				n, _ := f.sharedStringTemp.WriteString(si.String())
+func (f *File) buildSharedStringTable() (table *os.File, offsets [][]uint, err error) {
+	needClose, decoder, source, err := f.xmlDecoder(defaultXMLPathSharedStrings)
+	if err != nil {
+		return nil, nil, err
+	}
+	// Publish the cache only after the entire source and its close succeeded.
+	defer func() {
+		if err != nil && table != nil {
+			err = errors.Join(err, table.Close(), os.Remove(table.Name()))
+			table, offsets = nil, nil
+		}
+	}()
+	if needClose {
+		defer func() { err = errors.Join(err, source.Close()) }()
+	}
+	table, err = os.CreateTemp(f.options.TmpDir, "excelize-")
+	if err != nil {
+		return nil, nil, err
+	}
+	var offset uint
+	var path []xml.Name
+	rootSeen := false
+	for {
+		token, readErr := decoder.Token()
+		if readErr == io.EOF && rootSeen && len(path) == 0 {
+			return table, offsets, nil
+		}
+		if readErr != nil {
+			return table, nil, readErr
+		}
+		switch element := token.(type) {
+		case xml.StartElement:
+			if len(path) == 0 {
+				if rootSeen || element.Name.Local != "sst" {
+					return table, nil, fmt.Errorf("unexpected shared strings root %q", element.Name.Local)
+				}
+				rootSeen = true
+			}
+			if element.Name.Local == "si" {
+				if len(path) != 1 {
+					return table, nil, fmt.Errorf("unexpected shared string item")
+				}
+				var item xlsxSI
+				if err = decoder.DecodeElement(&item, &element); err != nil {
+					return table, nil, err
+				}
+				n, writeErr := table.WriteString(item.String())
+				if writeErr != nil {
+					return table, nil, writeErr
+				}
+				offsets = append(offsets, []uint{offset, offset + uint(n)})
 				offset += uint(n)
-				f.sharedStringItem = append(f.sharedStringItem, []uint{startIdx, offset})
-				i++
+				continue
+			}
+			path = append(path, element.Name)
+		case xml.EndElement:
+			path = path[:len(path)-1]
+		case xml.CharData:
+			if !rootSeen {
+				element = bytes.TrimPrefix(element, []byte("\xef\xbb\xbf"))
+			}
+			if len(path) == 0 && len(bytes.TrimSpace(element)) != 0 {
+				return table, nil, fmt.Errorf("unexpected text outside shared strings root")
 			}
 		}
 	}
-	return f.getFromStringItem(index)
 }
 
 // xmlDecoder creates XML decoder by given path in the zip from memory data
