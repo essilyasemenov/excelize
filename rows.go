@@ -377,7 +377,7 @@ func (cell *xlsxC) cellXMLHandler(decoder *xml.Decoder, start *xml.StartElement)
 					return fmt.Errorf("duplicate or conflicting cell value")
 				}
 				valueSeen = true
-				err = decoder.DecodeElement(&cell.V, &se)
+				cell.V, err = readTextElement(decoder, se)
 			case "f":
 				if formulaSeen {
 					return fmt.Errorf("duplicate cell formula")
@@ -398,8 +398,15 @@ func (cell *xlsxC) cellXMLHandler(decoder *xml.Decoder, start *xml.StartElement)
 			if err != nil {
 				return err
 			}
+		case xml.CharData:
+			if len(bytes.Trim(el, " \t\r\n")) != 0 {
+				return fmt.Errorf("unexpected text outside cell value")
+			}
 		case xml.EndElement:
 			if el == start.End() {
+				if inlineSeen && cell.T != "inlineStr" || cell.T == "inlineStr" && (valueSeen || formulaSeen) {
+					return fmt.Errorf("cell type %q conflicts with its value", cell.T)
+				}
 				return nil
 			}
 		}

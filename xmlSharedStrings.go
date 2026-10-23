@@ -12,7 +12,10 @@
 package excelize
 
 import (
+	"bytes"
 	"encoding/xml"
+	"fmt"
+	"strings"
 	"sync"
 )
 
@@ -45,6 +48,44 @@ type xlsxSI struct {
 	PhoneticPr *xlsxPhoneticPr    `xml:"phoneticPr"`
 }
 
+// UnmarshalXML keeps inline and shared strings on the same lossless read path.
+func (item *xlsxSI) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error {
+	*item = xlsxSI{}
+	return readStringElements(decoder, start, func(element xml.StartElement) error {
+		switch element.Name.Local {
+		case "t":
+			if item.T != nil || len(item.R) != 0 {
+				return fmt.Errorf("duplicate or conflicting string text")
+			}
+			return decoder.DecodeElement(&item.T, &element)
+		case "r":
+			if item.T != nil {
+				return fmt.Errorf("conflicting simple and rich string text")
+			}
+			var run xlsxR
+			if err := decoder.DecodeElement(&run, &element); err != nil {
+				return err
+			}
+			item.R = append(item.R, run)
+			return nil
+		case "rPh":
+			var run xlsxPhoneticRun
+			if err := decoder.DecodeElement(&run, &element); err != nil {
+				return err
+			}
+			item.RPh = append(item.RPh, &run)
+			return nil
+		case "phoneticPr":
+			if item.PhoneticPr != nil {
+				return fmt.Errorf("duplicate phonetic properties")
+			}
+			return decoder.DecodeElement(&item.PhoneticPr, &element)
+		default:
+			return fmt.Errorf("unexpected string element %q", element.Name.Local)
+		}
+	})
+}
+
 // xlsxR represents a run of rich text. A rich text run is a region of text
 // that share a common set of properties, such as formatting properties. The
 // properties are defined in the rPr element, and the text displayed to the
@@ -55,11 +96,91 @@ type xlsxR struct {
 	T       *xlsxT   `xml:"t"`
 }
 
+// UnmarshalXML rejects text that ordinary struct decoding would overwrite or skip.
+func (run *xlsxR) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error {
+	*run = xlsxR{XMLName: start.Name}
+	return readStringElements(decoder, start, func(element xml.StartElement) error {
+		switch element.Name.Local {
+		case "t":
+			if run.T != nil {
+				return fmt.Errorf("duplicate rich string text")
+			}
+			return decoder.DecodeElement(&run.T, &element)
+		case "rPr":
+			if run.RPr != nil {
+				return fmt.Errorf("duplicate rich string properties")
+			}
+			return decoder.DecodeElement(&run.RPr, &element)
+		default:
+			return fmt.Errorf("unexpected rich string element %q", element.Name.Local)
+		}
+	})
+}
+
 // xlsxT directly maps the t element in the run properties.
 type xlsxT struct {
 	XMLName xml.Name `xml:"t"`
 	Space   xml.Attr `xml:"space,attr,omitempty"`
 	Val     string   `xml:",chardata"`
+}
+
+// UnmarshalXML preserves text and whitespace without discarding nested content.
+func (text *xlsxT) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error {
+	if start.Name.Local != "t" {
+		return fmt.Errorf("unexpected text element %q", start.Name.Local)
+	}
+	*text = xlsxT{XMLName: start.Name}
+	for _, attr := range start.Attr {
+		if attr.Name.Local == "space" {
+			text.Space = attr
+		}
+	}
+	var err error
+	text.Val, err = readTextElement(decoder, start)
+	return err
+}
+
+func readTextElement(decoder *xml.Decoder, start xml.StartElement) (string, error) {
+	var value strings.Builder
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return "", err
+		}
+		switch element := token.(type) {
+		case xml.CharData:
+			value.Write(element)
+		case xml.StartElement:
+			return "", fmt.Errorf("unexpected nested element %q in %q", element.Name.Local, start.Name.Local)
+		case xml.EndElement:
+			if element == start.End() {
+				return value.String(), nil
+			}
+		}
+	}
+}
+
+func readStringElements(decoder *xml.Decoder, start xml.StartElement, read func(xml.StartElement) error) error {
+	for {
+		token, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+		switch element := token.(type) {
+		case xml.StartElement:
+			if err := read(element); err != nil {
+				return err
+			}
+		case xml.CharData:
+			if len(bytes.Trim(element, " \t\r\n")) != 0 {
+				return fmt.Errorf("unexpected text in %q", start.Name.Local)
+			}
+		case xml.EndElement:
+			if element == start.End() {
+				return nil
+			}
+		}
+	}
 }
 
 // xlsxRPr (Run Properties) specifies a set of run properties which shall be
