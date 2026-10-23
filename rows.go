@@ -668,7 +668,7 @@ func (f *File) sharedStringsReader() (*xlsxSST, error) {
 	if f.SharedStrings == nil {
 		var sharedStrings xlsxSST
 		ss := f.readXML(defaultXMLPathSharedStrings)
-		if err = f.xmlNewDecoder(bytes.NewReader(namespaceStrictToTransitional(ss))).
+		if err = f.xmlNewDecoder(bytes.NewReader(ss)).
 			Decode(&sharedStrings); err != nil && err != io.EOF {
 			return f.SharedStrings, err
 		}

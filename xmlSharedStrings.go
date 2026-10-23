@@ -34,6 +34,15 @@ type xlsxSST struct {
 	SI          []xlsxSI `xml:"si"`
 }
 
+// UnmarshalXML normalizes only the root namespace, never string values.
+func (table *xlsxSST) UnmarshalXML(decoder *xml.Decoder, start xml.StartElement) error {
+	if start.Name.Space == StrictNameSpaceSpreadSheet {
+		start.Name.Space = NameSpaceSpreadSheet.Value
+	}
+	type plainSST xlsxSST
+	return decoder.DecodeElement((*plainSST)(table), &start)
+}
+
 // xlsxSI (String Item) is the representation of an individual string in the
 // Shared String table. If the string is just a simple string with formatting
 // applied at the cell level, then the String Item (si) should contain a
